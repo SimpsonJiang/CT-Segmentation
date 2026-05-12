@@ -131,11 +131,3 @@ outputs/
 ├── best_model.pth        # 最佳模型检查点
 └── checkpoint_epoch_*.pth # 周期性检查点
 ```
-
-## 致谢
-
-本项目参考了 3D U-Net 医学图像分割架构。
-
-## 许可证
-
-MIT License
