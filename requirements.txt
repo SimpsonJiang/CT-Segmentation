@@ -1,0 +1,9 @@
+torch>=2.0.0
+torchvision
+numpy
+nibabel>=4.0.0
+scipy
+scikit-learn
+matplotlib
+tqdm
+tensorboard
