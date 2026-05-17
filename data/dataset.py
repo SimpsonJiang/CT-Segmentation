@@ -120,10 +120,6 @@ class CTSegmentationDataset(Dataset):
             return data[start:end]
         else:
             # Pad: pad to target_d, centered
-            pad_before = max(0, center_d - target_d // 2)
-            pad_after = max(0, target_d - current_d - pad_before)
-
-            # If label is near edge, adjust padding
             total_pad = target_d - current_d
             pad_before = total_pad // 2
             pad_after = total_pad - pad_before
@@ -132,18 +128,18 @@ class CTSegmentationDataset(Dataset):
             return np.pad(data, pad_width, mode='constant', constant_values=0)
 
     def _extract_random_patch(self, ct_data, label_data):
-        """Extract random patch of fixed size from CT and label"""
+        """Extract patch of fixed size from CT and label.
+        50% chance to sample centered on label region, 50% random.
+        """
         d, h, w = ct_data.shape
         patch_d, patch_h, patch_w = self.patch_size
 
         # If data is smaller than patch in any dimension, pad it
         if d < patch_d or h < patch_h or w < patch_w:
-            # Calculate padding needed
             pad_d = max(0, patch_d - d)
             pad_h = max(0, patch_h - h)
             pad_w = max(0, patch_w - w)
 
-            # Pad the data
             ct_data = np.pad(ct_data, [(pad_d//2, pad_d - pad_d//2),
                                         (pad_h//2, pad_h - pad_h//2),
                                         (pad_w//2, pad_w - pad_w//2)], mode='constant', constant_values=0)
@@ -153,21 +149,38 @@ class CTSegmentationDataset(Dataset):
 
             d, h, w = ct_data.shape
 
-        # Random crop position
-        if d > patch_d:
-            start_d = np.random.randint(0, d - patch_d)
-        else:
-            start_d = 0
+        # Find label center for "centered" sampling
+        label_slices = []
+        for d_idx in range(d):
+            if label_data[d_idx, :, :].max() > 0:
+                label_slices.append(d_idx)
 
-        if h > patch_h:
-            start_h = np.random.randint(0, h - patch_h)
-        else:
-            start_h = 0
+        # 50% chance: sample centered on label region
+        if label_slices and np.random.rand() < 0.5:
+            label_center_d = (min(label_slices) + max(label_slices)) // 2
 
-        if w > patch_w:
-            start_w = np.random.randint(0, w - patch_w)
+            # Find a random H, W position within label region for this slice
+            label_slice_2d = label_data[label_center_d, :, :]
+            label_h_indices, label_w_indices = np.where(label_slice_2d > 0.5)
+
+            if len(label_h_indices) > 0 and len(label_w_indices) > 0:
+                # Random center within label region
+                center_h = np.random.choice(label_h_indices)
+                center_w = np.random.choice(label_w_indices)
+            else:
+                # No label in this slice, use random
+                center_h = np.random.randint(patch_h // 2, h - patch_h // 2)
+                center_w = np.random.randint(patch_w // 2, w - patch_w // 2)
+
+            # Calculate start positions (patch centered on label region with some randomness)
+            start_d = max(0, min(label_center_d - patch_d // 2 + np.random.randint(-10, 10), d - patch_d))
+            start_h = max(0, min(center_h - patch_h // 2, h - patch_h))
+            start_w = max(0, min(center_w - patch_w // 2, w - patch_w))
         else:
-            start_w = 0
+            # 50% chance: pure random crop
+            start_d = np.random.randint(0, max(1, d - patch_d)) if d > patch_d else 0
+            start_h = np.random.randint(0, max(1, h - patch_h)) if h > patch_h else 0
+            start_w = np.random.randint(0, max(1, w - patch_w)) if w > patch_w else 0
 
         # Extract patch
         ct_patch = ct_data[start_d:start_d + patch_d,

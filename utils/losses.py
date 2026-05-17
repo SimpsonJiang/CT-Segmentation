@@ -14,7 +14,8 @@ class DiceLoss(nn.Module):
         self.smooth = smooth
 
     def forward(self, pred, target):
-        pred = pred.view(-1)
+        # Apply sigmoid to convert logits to probabilities
+        pred = torch.sigmoid(pred).view(-1)
         target = target.view(-1)
 
         intersection = (pred * target).sum()
