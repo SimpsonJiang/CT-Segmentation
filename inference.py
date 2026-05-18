@@ -8,6 +8,7 @@ import glob
 import numpy as np
 import torch
 import nibabel as nib
+from scipy import ndimage
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).parent))
@@ -33,37 +34,121 @@ def load_model(checkpoint_path, device):
     return model
 
 
-def predict_ct(model, ct_path, device, threshold=0.5):
-    """Predict segmentation for a single CT scan"""
-    # Load CT scan
-    ct_nifti = nib.load(ct_path)
-    ct_data = ct_nifti.get_fdata().astype(np.float32)
+def resample_to_spacing(data, original_spacing, target_spacing):
+    """Resample 3D volume to target spacing"""
+    zoom_factors = np.array(original_spacing) / np.array(target_spacing)
+    resampled = ndimage.zoom(data, zoom_factors, order=1)
+    return resampled
 
-    # Normalize CT to [0, 1]
-    ct_min, ct_max = ct_data.min(), ct_data.max()
-    if ct_max > ct_min:
-        ct_data = (ct_data - ct_min) / (ct_max - ct_min)
 
-    # Convert to tensor
-    ct_tensor = torch.from_numpy(ct_data).unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, 1, D, H, W)
+def preprocess_ct(ct_nifti):
+    """Preprocess CT scan with same preprocessing as training"""
+    # Keep original info for converting back to LPS later
+    original_shape = ct_nifti.shape
+    original_affine = ct_nifti.affine
 
-    # Predict
+    # Get original orientation (LPS)
+    original_ornt = nib.io_orientation(original_affine)
+
+    # 1. Orientation to RAS
+    ct_ras = nib.as_closest_canonical(ct_nifti)
+    ct_data = np.asarray(ct_ras.get_fdata(), dtype=np.float32)
+    ras_spacing = ct_ras.header.get_zooms()
+
+    # Get RAS orientation
+    ras_ornt = nib.io_orientation(ct_ras.affine)
+
+    # 2. Resample to target spacing
+    ct_data = resample_to_spacing(ct_data, ras_spacing, TARGET_SPACING)
+
+    # 3. Clip HU window
+    ct_data = np.clip(ct_data, HU_WINDOW_MIN, HU_WINDOW_MAX)
+
+    # 4. Z-score normalization
+    if ct_data.std() > 0:
+        ct_data = (ct_data - ct_data.mean()) / ct_data.std()
+    else:
+        ct_data = ct_data - ct_data.mean()
+
+    return ct_data, original_shape, original_affine, original_ornt, ras_ornt
+
+
+def predict_ct_sliding_window(model, ct_data, device, patch_size=PATCH_SIZE, overlap=0.5, threshold=0.5):
+    """Predict using sliding window approach"""
+    d, h, w = ct_data.shape
+    patch_d, patch_h, patch_w = patch_size
+
+    # Calculate stride (50% overlap by default)
+    stride_d = int(patch_d * (1 - overlap))
+    stride_h = int(patch_h * (1 - overlap))
+    stride_w = int(patch_w * (1 - overlap))
+
+    # Initialize output accumulator and count map
+    output = np.zeros((d, h, w), dtype=np.float32)
+    count_map = np.zeros((d, h, w), dtype=np.float32)
+
+    # Sliding window inference
+    with torch.no_grad():
+        for start_d in range(0, d - patch_d + 1, stride_d):
+            for start_h in range(0, h - patch_h + 1, stride_h):
+                for start_w in range(0, w - patch_w + 1, stride_w):
+                    # Extract patch
+                    patch = ct_data[start_d:start_d + patch_d,
+                                   start_h:start_h + patch_h,
+                                   start_w:start_w + patch_w]
+
+                    # Convert to tensor (1, 1, D, H, W)
+                    patch_tensor = torch.from_numpy(patch).unsqueeze(0).unsqueeze(0).float().to(device)
+
+                    # Predict
+                    pred = model(patch_tensor)
+                    pred_prob = torch.sigmoid(pred).squeeze().cpu().numpy()
+
+                    # Accumulate
+                    output[start_d:start_d + patch_d,
+                           start_h:start_h + patch_h,
+                           start_w:start_w + patch_w] += pred_prob
+                    count_map[start_d:start_d + patch_d,
+                              start_h:start_h + patch_h,
+                              start_w:start_w + patch_w] += 1
+
+    # Average overlapping predictions
+    count_map[count_map == 0] = 1  # Avoid division by zero
+    output = output / count_map
+
+    # Threshold
+    pred_mask = (output > threshold).astype(np.uint8)
+
+    return pred_mask
+
+
+def predict_ct_full_volume(model, ct_data, device, threshold=0.5):
+    """Predict on full volume (may cause memory issues for large volumes)"""
+    # Convert to tensor (1, 1, D, H, W)
+    ct_tensor = torch.from_numpy(ct_data).unsqueeze(0).unsqueeze(0).float().to(device)
+
     with torch.no_grad():
         pred = model(ct_tensor)
+        pred_prob = torch.sigmoid(pred).squeeze().cpu().numpy()
 
-    # Apply sigmoid to get probabilities, then threshold
-    pred_prob = torch.sigmoid(pred)
-    pred_mask = (pred_prob.squeeze().cpu().numpy() > threshold).astype(np.uint8)
+    pred_mask = (pred_prob > threshold).astype(np.uint8)
+    return pred_mask
 
-    return pred_mask, ct_nifti.affine, ct_nifti.header
+
+def resample_to_shape(data, target_shape):
+    """Resample 3D volume to target shape"""
+    zoom_factors = np.array(target_shape) / np.array(data.shape)
+    resampled = ndimage.zoom(data, zoom_factors, order=0)  # order=0 for nearest neighbor (binary mask)
+    return resampled
 
 
 def main():
     parser = argparse.ArgumentParser(description="Run inference on CT scans")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint")
-    parser.add_argument("--input", type=str, required=True, help="Input CT file or directory")
-    parser.add_argument("--output", type=str, required=True, help="Output directory")
+    parser.add_argument("--checkpoint", type=str, default="F:\\2.0\\outputs\\best_model.pth", help="Path to model checkpoint")
+    parser.add_argument("--input", type=str, default="F:\\2.0\\pre_ct\\1__Se202__1.0 x 0.8__04.18132.nii.gz", help="Input CT file or directory")
+    parser.add_argument("--output", type=str, default="F:\\2.0\\pre_ct_seg_pred", help="Output directory")
     parser.add_argument("--threshold", type=float, default=0.5, help="Prediction threshold")
+    parser.add_argument("--sliding_window", action="store_true", help="Use sliding window inference")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -89,13 +174,39 @@ def main():
     for ct_path in ct_files:
         print(f"Processing: {ct_path}")
 
-        pred_mask, affine, header = predict_ct(model, ct_path, device, args.threshold)
+        # Load CT scan
+        ct_nifti = nib.load(ct_path)
 
-        # Save prediction
+        # Preprocess (same as training) - returns processed data, original shape, original affine, and orientation transforms
+        ct_data, original_shape, original_affine, original_ornt, ras_ornt = preprocess_ct(ct_nifti)
+        print(f"  Original shape: {original_shape}, Preprocessed shape: {ct_data.shape}")
+
+        # Predict
+        if args.sliding_window:
+            print(f"  Using sliding window inference with patch size {PATCH_SIZE}")
+            pred_mask = predict_ct_sliding_window(model, ct_data, device, PATCH_SIZE, overlap=0.5, threshold=args.threshold)
+        else:
+            print(f"  Using full volume inference")
+            pred_mask = predict_ct_full_volume(model, ct_data, device, args.threshold)
+
+        print(f"  Predicted shape (preprocessed space): {pred_mask.shape}")
+
+        # Resample prediction back to original input dimensions
+        pred_mask_original = resample_to_shape(pred_mask, original_shape)
+        print(f"  Resampled to original shape: {pred_mask_original.shape}")
+
+        # Convert from RAS back to LPS orientation
+        # ras_ornt represents RAS, original_ornt represents LPS
+        # To go from RAS to LPS, we need the inverse of (ras_ornt - original_ornt)
+        ras_to_lps = nib.orientations.ornt_transform(ras_ornt, original_ornt)
+        pred_mask_lps = nib.orientations.apply_orientation(pred_mask_original, ras_to_lps)
+        print(f"  Converted to LPS orientation: {pred_mask_lps.shape}")
+
+        # Save prediction with original LPS affine
         output_name = Path(ct_path).stem + "_pred.nii.gz"
         output_path = output_dir / output_name
 
-        pred_nifti = nib.Nifti1Image(pred_mask, affine, header=header)
+        pred_nifti = nib.Nifti1Image(pred_mask_lps, original_affine)
         nib.save(pred_nifti, output_path)
 
         print(f"  Saved to: {output_path}")
