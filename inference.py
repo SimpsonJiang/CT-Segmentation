@@ -74,28 +74,40 @@ def preprocess_ct(ct_nifti):
 
 
 def predict_ct_sliding_window(model, ct_data, device, patch_size=PATCH_SIZE, overlap=0.5, threshold=0.5):
-    """Predict using sliding window approach"""
+    """Predict using sliding window approach with reflection padding for edge coverage"""
     d, h, w = ct_data.shape
     patch_d, patch_h, patch_w = patch_size
+
+    # Reflect pad edges to ensure full coverage of original volume
+    pad_d = patch_d // 2
+    pad_h = patch_h // 2
+    pad_w = patch_w // 2
+
+    ct_data_padded = np.pad(ct_data,
+                             ((pad_d, pad_d), (pad_h, pad_h), (pad_w, pad_w)),
+                             mode='reflect')
+
+    # Padded volume size
+    d_padded, h_padded, w_padded = ct_data_padded.shape
 
     # Calculate stride (50% overlap by default)
     stride_d = int(patch_d * (1 - overlap))
     stride_h = int(patch_h * (1 - overlap))
     stride_w = int(patch_w * (1 - overlap))
 
-    # Initialize output accumulator and count map
+    # Initialize output accumulator and count map (original size)
     output = np.zeros((d, h, w), dtype=np.float32)
     count_map = np.zeros((d, h, w), dtype=np.float32)
 
-    # Sliding window inference
+    # Sliding window inference on padded volume
     with torch.no_grad():
-        for start_d in range(0, d - patch_d + 1, stride_d):
-            for start_h in range(0, h - patch_h + 1, stride_h):
-                for start_w in range(0, w - patch_w + 1, stride_w):
-                    # Extract patch
-                    patch = ct_data[start_d:start_d + patch_d,
-                                   start_h:start_h + patch_h,
-                                   start_w:start_w + patch_w]
+        for start_d in range(0, d_padded - patch_d + 1, stride_d):
+            for start_h in range(0, h_padded - patch_h + 1, stride_h):
+                for start_w in range(0, w_padded - patch_w + 1, stride_w):
+                    # Extract patch from padded volume
+                    patch = ct_data_padded[start_d:start_d + patch_d,
+                                           start_h:start_h + patch_h,
+                                           start_w:start_w + patch_w]
 
                     # Convert to tensor (1, 1, D, H, W)
                     patch_tensor = torch.from_numpy(patch).unsqueeze(0).unsqueeze(0).float().to(device)
@@ -104,13 +116,28 @@ def predict_ct_sliding_window(model, ct_data, device, patch_size=PATCH_SIZE, ove
                     pred = model(patch_tensor)
                     pred_prob = torch.sigmoid(pred).squeeze().cpu().numpy()
 
-                    # Accumulate
-                    output[start_d:start_d + patch_d,
-                           start_h:start_h + patch_h,
-                           start_w:start_w + patch_w] += pred_prob
-                    count_map[start_d:start_d + patch_d,
-                              start_h:start_h + patch_h,
-                              start_w:start_w + patch_w] += 1
+                    # Map patch prediction back to original (non-padded) coordinates
+                    out_start_d = max(0, start_d - pad_d)
+                    out_start_h = max(0, start_h - pad_h)
+                    out_start_w = max(0, start_w - pad_w)
+
+                    out_end_d = min(d, start_d - pad_d + patch_d)
+                    out_end_h = min(h, start_h - pad_h + patch_h)
+                    out_end_w = min(w, start_w - pad_w + patch_w)
+
+                    # Corresponding region within the patch
+                    patch_out_start_d = out_start_d - (start_d - pad_d)
+                    patch_out_start_h = out_start_h - (start_h - pad_h)
+                    patch_out_start_w = out_start_w - (start_w - pad_w)
+
+                    output[out_start_d:out_end_d,
+                           out_start_h:out_end_h,
+                           out_start_w:out_end_w] += pred_prob[patch_out_start_d:patch_out_start_d + (out_end_d - out_start_d),
+                                                               patch_out_start_h:patch_out_start_h + (out_end_h - out_start_h),
+                                                               patch_out_start_w:patch_out_start_w + (out_end_w - out_start_w)]
+                    count_map[out_start_d:out_end_d,
+                              out_start_h:out_end_h,
+                              out_start_w:out_end_w] += 1
 
     # Average overlapping predictions
     count_map[count_map == 0] = 1  # Avoid division by zero
