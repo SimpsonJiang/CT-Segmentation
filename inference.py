@@ -175,7 +175,7 @@ def main():
     parser.add_argument("--input", type=str, default="F:\\2.0\\pre_ct\\1__Se202__1.0 x 0.8__04.18132.nii.gz", help="Input CT file or directory")
     parser.add_argument("--output", type=str, default="F:\\2.0\\pre_ct_seg_pred", help="Output directory")
     parser.add_argument("--threshold", type=float, default=0.5, help="Prediction threshold")
-    parser.add_argument("--sliding_window", action="store_true", help="Use sliding window inference")
+    parser.add_argument("--sliding_window", default=True, help="Use sliding window inference")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
