@@ -243,9 +243,8 @@ class CTSegmentationDataset(Dataset):
         # 4. Crop D dimension centered at label
         label_data = self._crop_d_centered(label_data, label_center_d, self.target_d_size)
 
-        # Binarize label
-        label_data = (label_data > 0.5).astype(np.float32)
-
+        # Keep multi-class labels (0=background, 1=scapula, 2=femur)
+        # No binarization needed
         return label_data
 
     def __len__(self):
@@ -267,7 +266,8 @@ class CTSegmentationDataset(Dataset):
 
         # Convert to tensor (C, D, H, W)
         ct_tensor = torch.from_numpy(ct_data).unsqueeze(0).float()
-        label_tensor = torch.from_numpy(label_data).unsqueeze(0).float()
+        # Label as long tensor for CrossEntropyLoss (multi-class)
+        label_tensor = torch.from_numpy(label_data).unsqueeze(0).long()
 
         return ct_tensor, label_tensor
 

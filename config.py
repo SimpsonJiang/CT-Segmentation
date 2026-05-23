@@ -14,7 +14,7 @@ TRAIN_IDS = list(range(1, 118))  # 77 to 117 inclusive
 
 # Model
 IN_CHANNELS = 1          # CT is single channel (grayscale)
-OUT_CHANNELS = 1        # Binary segmentation
+OUT_CHANNELS = 2        # Multi-class segmentation (scapula + femur)
 FEATURE_DEPTHS = [32, 64, 128, 256]  # Encoder depths
 USE_ATTENTION = True    # Use attention gates
 USE_RESIDUAL = True     # Use residual connections
@@ -27,7 +27,7 @@ WEIGHT_DECAY = 1e-5
 NUM_WORKERS = 0  # Set to 0 on Windows to avoid multiprocessing issues
 
 # Loss
-LOSS_TYPE = "dice_ce"    # dice_ce, dice, ce
+LOSS_TYPE = "multi_dice_ce_boundary"    # multi_dice_ce_boundary, multi_dice_ce, dice_ce, dice, ce
 
 # Preprocessing
 TARGET_SPACING = [1.0, 1.0, 1.0]  # mm (D, H, W)

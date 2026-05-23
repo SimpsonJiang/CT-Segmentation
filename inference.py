@@ -73,7 +73,7 @@ def preprocess_ct(ct_nifti):
     return ct_data, original_shape, original_affine, original_ornt, ras_ornt
 
 
-def predict_ct_sliding_window(model, ct_data, device, patch_size=PATCH_SIZE, overlap=0.5, threshold=0.5):
+def predict_ct_sliding_window(model, ct_data, device, patch_size=PATCH_SIZE, overlap=0.5):
     """Predict using sliding window approach with reflection padding for edge coverage"""
     d, h, w = ct_data.shape
     patch_d, patch_h, patch_w = patch_size
@@ -95,8 +95,9 @@ def predict_ct_sliding_window(model, ct_data, device, patch_size=PATCH_SIZE, ove
     stride_h = int(patch_h * (1 - overlap))
     stride_w = int(patch_w * (1 - overlap))
 
-    # Initialize output accumulator and count map (original size)
-    output = np.zeros((d, h, w), dtype=np.float32)
+    # Initialize output accumulator for multi-class (C, D, H, W) and count map
+    num_classes = OUT_CHANNELS
+    output = np.zeros((num_classes, d, h, w), dtype=np.float32)
     count_map = np.zeros((d, h, w), dtype=np.float32)
 
     # Sliding window inference on padded volume
@@ -112,9 +113,9 @@ def predict_ct_sliding_window(model, ct_data, device, patch_size=PATCH_SIZE, ove
                     # Convert to tensor (1, 1, D, H, W)
                     patch_tensor = torch.from_numpy(patch).unsqueeze(0).unsqueeze(0).float().to(device)
 
-                    # Predict
+                    # Predict - get softmax probabilities for multi-class
                     pred = model(patch_tensor)
-                    pred_prob = torch.sigmoid(pred).squeeze().cpu().numpy()
+                    pred_prob = torch.softmax(pred, dim=1).squeeze(0).cpu().numpy()  # (C, D, H, W)
 
                     # Map patch prediction back to original (non-padded) coordinates
                     out_start_d = max(0, start_d - pad_d)
@@ -130,35 +131,42 @@ def predict_ct_sliding_window(model, ct_data, device, patch_size=PATCH_SIZE, ove
                     patch_out_start_h = out_start_h - (start_h - pad_h)
                     patch_out_start_w = out_start_w - (start_w - pad_w)
 
-                    output[out_start_d:out_end_d,
-                           out_start_h:out_end_h,
-                           out_start_w:out_end_w] += pred_prob[patch_out_start_d:patch_out_start_d + (out_end_d - out_start_d),
-                                                               patch_out_start_h:patch_out_start_h + (out_end_h - out_start_h),
-                                                               patch_out_start_w:patch_out_start_w + (out_end_w - out_start_w)]
+                    # Accumulate class-wise predictions
+                    for c in range(num_classes):
+                        output[c, out_start_d:out_end_d,
+                               out_start_h:out_end_h,
+                               out_start_w:out_end_w] += pred_prob[c,
+                                                                     patch_out_start_d:patch_out_start_d + (out_end_d - out_start_d),
+                                                                     patch_out_start_h:patch_out_start_h + (out_end_h - out_start_h),
+                                                                     patch_out_start_w:patch_out_start_w + (out_end_w - out_start_w)]
+
                     count_map[out_start_d:out_end_d,
                               out_start_h:out_end_h,
                               out_start_w:out_end_w] += 1
 
     # Average overlapping predictions
     count_map[count_map == 0] = 1  # Avoid division by zero
-    output = output / count_map
+    for c in range(num_classes):
+        output[c] = output[c] / count_map
 
-    # Threshold
-    pred_mask = (output > threshold).astype(np.uint8)
+    # Get final class prediction via argmax
+    pred_mask = np.argmax(output, axis=0).astype(np.uint8)
 
     return pred_mask
 
 
-def predict_ct_full_volume(model, ct_data, device, threshold=0.5):
+def predict_ct_full_volume(model, ct_data, device):
     """Predict on full volume (may cause memory issues for large volumes)"""
     # Convert to tensor (1, 1, D, H, W)
     ct_tensor = torch.from_numpy(ct_data).unsqueeze(0).unsqueeze(0).float().to(device)
 
     with torch.no_grad():
         pred = model(ct_tensor)
-        pred_prob = torch.sigmoid(pred).squeeze().cpu().numpy()
+        # Use softmax for multi-class
+        pred_prob = torch.softmax(pred, dim=1).squeeze(0).cpu().numpy()  # (C, D, H, W)
 
-    pred_mask = (pred_prob > threshold).astype(np.uint8)
+    # Get final class prediction via argmax
+    pred_mask = np.argmax(pred_prob, axis=0).astype(np.uint8)
     return pred_mask
 
 
@@ -172,10 +180,9 @@ def resample_to_shape(data, target_shape):
 def main():
     parser = argparse.ArgumentParser(description="Run inference on CT scans")
     parser.add_argument("--checkpoint", type=str, default="F:\\2.0\\outputs\\best_model.pth", help="Path to model checkpoint")
-    parser.add_argument("--input", type=str, default="F:\\2.0\\pre_ct\\1__Se202__1.0 x 0.8__04.18132.nii.gz", help="Input CT file or directory")
+    parser.add_argument("--input", type=str, default="F:\\2.0\\pre_ct\\3__Se3__Shoulder 1.0 I40s 1__00010870.nii.gz", help="Input CT file or directory")
     parser.add_argument("--output", type=str, default="F:\\2.0\\pre_ct_seg_pred", help="Output directory")
-    parser.add_argument("--threshold", type=float, default=0.5, help="Prediction threshold")
-    parser.add_argument("--sliding_window", default=True, help="Use sliding window inference")
+    parser.add_argument("--sliding_window", action="store_true", default=True, help="Use sliding window inference")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -211,10 +218,10 @@ def main():
         # Predict
         if args.sliding_window:
             print(f"  Using sliding window inference with patch size {PATCH_SIZE}")
-            pred_mask = predict_ct_sliding_window(model, ct_data, device, PATCH_SIZE, overlap=0.5, threshold=args.threshold)
+            pred_mask = predict_ct_sliding_window(model, ct_data, device, PATCH_SIZE, overlap=0.5)
         else:
             print(f"  Using full volume inference")
-            pred_mask = predict_ct_full_volume(model, ct_data, device, args.threshold)
+            pred_mask = predict_ct_full_volume(model, ct_data, device)
 
         print(f"  Predicted shape (preprocessed space): {pred_mask.shape}")
 

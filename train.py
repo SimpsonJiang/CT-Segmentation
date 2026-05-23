@@ -18,7 +18,7 @@ sys.path.append(str(Path(__file__).parent))
 from config import *
 from models import AttentionResUNet3D
 from data import CTSegmentationDataset, collate_fn
-from utils import get_loss_fn, dice_score, iou_score, f1_score
+from utils import get_loss_fn, multi_class_dice_score, multi_class_iou_score, multi_class_surface_metrics
 
 
 def set_seed(seed=42):
@@ -56,9 +56,11 @@ def train_epoch(model, dataloader, criterion, optimizer, scaler, device, epoch):
             optimizer.step()
 
         running_loss += loss.item()
-        running_dice += dice_score(torch.sigmoid(pred), label)
+        # Multi-class Dice: get mean dice across classes
+        dice_result = multi_class_dice_score(pred, label, OUT_CHANNELS)
+        running_dice += dice_result['mean']
 
-        pbar.set_postfix({"loss": f"{loss.item():.4f}", "dice": f"{dice_score(torch.sigmoid(pred), label):.4f}"})
+        pbar.set_postfix({"loss": f"{loss.item():.4f}", "dice": f"{dice_result['mean']:.4f}"})
 
     epoch_loss = running_loss / len(dataloader)
     epoch_dice = running_dice / len(dataloader)
@@ -72,7 +74,9 @@ def validate_epoch(model, dataloader, criterion, device, epoch):
     running_loss = 0.0
     running_dice = 0.0
     running_iou = 0.0
-    running_f1 = 0.0
+    running_hd95 = 0.0
+    running_asd = 0.0
+    running_surface_dice = 0.0
 
     with torch.no_grad():
         pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Val]")
@@ -82,19 +86,29 @@ def validate_epoch(model, dataloader, criterion, device, epoch):
 
             pred = model(ct)
             loss = criterion(pred, label)
-            pred_sig = torch.sigmoid(pred)
 
             running_loss += loss.item()
-            running_dice += dice_score(pred_sig, label)
-            running_iou += iou_score(pred_sig, label)
-            running_f1 += f1_score(pred_sig, label)
+
+            # Multi-class Dice and IoU
+            dice_result = multi_class_dice_score(pred, label, OUT_CHANNELS)
+            iou_result = multi_class_iou_score(pred, label, OUT_CHANNELS)
+            running_dice += dice_result['mean']
+            running_iou += iou_result['mean']
+
+            # Surface metrics (for each foreground class)
+            surface_metrics = multi_class_surface_metrics(pred, label, OUT_CHANNELS, voxel_spacing=TARGET_SPACING, threshold=1.0)
+            running_hd95 += surface_metrics['hd95_mean']
+            running_asd += surface_metrics['asd_mean']
+            running_surface_dice += surface_metrics['surface_dice_mean']
 
     epoch_loss = running_loss / len(dataloader)
     epoch_dice = running_dice / len(dataloader)
     epoch_iou = running_iou / len(dataloader)
-    epoch_f1 = running_f1 / len(dataloader)
+    epoch_hd95 = running_hd95 / len(dataloader)
+    epoch_asd = running_asd / len(dataloader)
+    epoch_surface_dice = running_surface_dice / len(dataloader)
 
-    return epoch_loss, epoch_dice, epoch_iou, epoch_f1
+    return epoch_loss, epoch_dice, epoch_iou, epoch_hd95, epoch_asd, epoch_surface_dice
 
 
 def main():
@@ -183,12 +197,13 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         train_loss, train_dice = train_epoch(model, train_loader, criterion, optimizer, scaler, device, epoch)
-        val_loss, val_dice, val_iou, val_f1 = validate_epoch(model, val_loader, criterion, device, epoch)
+        val_loss, val_dice, val_iou, val_hd95, val_asd, val_surface_dice = validate_epoch(model, val_loader, criterion, device, epoch)
 
         scheduler.step(val_loss)
 
         print(f"\nEpoch {epoch}: Train Loss: {train_loss:.4f}, Train Dice: {train_dice:.4f}")
-        print(f"           Val Loss: {val_loss:.4f}, Val Dice: {val_dice:.4f}, Val IoU: {val_iou:.4f}, Val F1: {val_f1:.4f}")
+        print(f"           Val Loss: {val_loss:.4f}, Val Dice: {val_dice:.4f}, Val IoU: {val_iou:.4f}")
+        print(f"           HD95: {val_hd95:.4f}, ASD: {val_asd:.4f}, Surface Dice: {val_surface_dice:.4f}")
 
         # Save best model
         if val_dice > best_dice:
@@ -200,6 +215,8 @@ def main():
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "best_dice": best_dice,
+                    "best_hd95": val_hd95,
+                    "best_asd": val_asd,
                 },
                 output_dir / "best_model.pth",
             )
