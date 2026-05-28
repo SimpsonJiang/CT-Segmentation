@@ -18,7 +18,7 @@ sys.path.append(str(Path(__file__).parent))
 from config import *
 from models import AttentionResUNet3D
 from data import CTSegmentationDataset, collate_fn
-from utils import get_loss_fn, multi_class_dice_score, multi_class_iou_score, multi_class_surface_metrics
+from utils import get_loss_fn, multi_class_dice_score, multi_class_iou_score, mean_pixel_accuracy, multi_class_surface_metrics
 
 
 def set_seed(seed=42):
@@ -74,6 +74,7 @@ def validate_epoch(model, dataloader, criterion, device, epoch):
     running_loss = 0.0
     running_dice = 0.0
     running_iou = 0.0
+    running_mpa = 0.0
     running_hd95 = 0.0
     running_asd = 0.0
     running_surface_dice = 0.0
@@ -89,11 +90,13 @@ def validate_epoch(model, dataloader, criterion, device, epoch):
 
             running_loss += loss.item()
 
-            # Multi-class Dice and IoU
+            # Multi-class Dice, IoU and MPA
             dice_result = multi_class_dice_score(pred, label, OUT_CHANNELS)
             iou_result = multi_class_iou_score(pred, label, OUT_CHANNELS)
+            mpa_result = mean_pixel_accuracy(pred, label, OUT_CHANNELS)
             running_dice += dice_result['mean']
             running_iou += iou_result['mean']
+            running_mpa += mpa_result['mean']
 
             # Surface metrics (for each foreground class)
             surface_metrics = multi_class_surface_metrics(pred, label, OUT_CHANNELS, voxel_spacing=TARGET_SPACING, threshold=1.0)
@@ -104,11 +107,12 @@ def validate_epoch(model, dataloader, criterion, device, epoch):
     epoch_loss = running_loss / len(dataloader)
     epoch_dice = running_dice / len(dataloader)
     epoch_iou = running_iou / len(dataloader)
+    epoch_mpa = running_mpa / len(dataloader)
     epoch_hd95 = running_hd95 / len(dataloader)
     epoch_asd = running_asd / len(dataloader)
     epoch_surface_dice = running_surface_dice / len(dataloader)
 
-    return epoch_loss, epoch_dice, epoch_iou, epoch_hd95, epoch_asd, epoch_surface_dice
+    return epoch_loss, epoch_dice, epoch_iou, epoch_mpa, epoch_hd95, epoch_asd, epoch_surface_dice
 
 
 def main():
@@ -197,12 +201,12 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         train_loss, train_dice = train_epoch(model, train_loader, criterion, optimizer, scaler, device, epoch)
-        val_loss, val_dice, val_iou, val_hd95, val_asd, val_surface_dice = validate_epoch(model, val_loader, criterion, device, epoch)
+        val_loss, val_dice, val_iou, val_mpa, val_hd95, val_asd, val_surface_dice = validate_epoch(model, val_loader, criterion, device, epoch)
 
         scheduler.step(val_loss)
 
         print(f"\nEpoch {epoch}: Train Loss: {train_loss:.4f}, Train Dice: {train_dice:.4f}")
-        print(f"           Val Loss: {val_loss:.4f}, Val Dice: {val_dice:.4f}, Val IoU: {val_iou:.4f}")
+        print(f"           Val Loss: {val_loss:.4f}, Val Dice: {val_dice:.4f}, Val IoU: {val_iou:.4f}, Val MPA: {val_mpa:.4f}")
         print(f"           HD95: {val_hd95:.4f}, ASD: {val_asd:.4f}, Surface Dice: {val_surface_dice:.4f}")
 
         # Save best model

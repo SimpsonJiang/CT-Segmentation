@@ -15,6 +15,7 @@ sys.path.append(str(Path(__file__).parent))
 
 from config import *
 from models import AttentionResUNet3D
+from utils import multi_class_dice_score, multi_class_iou_score, mean_pixel_accuracy, multi_class_surface_metrics
 
 
 def load_model(checkpoint_path, device):
@@ -27,7 +28,7 @@ def load_model(checkpoint_path, device):
         use_residual=USE_RESIDUAL,
     ).to(device)
 
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
@@ -179,9 +180,9 @@ def resample_to_shape(data, target_shape):
 
 def main():
     parser = argparse.ArgumentParser(description="Run inference on CT scans")
-    parser.add_argument("--checkpoint", type=str, default="F:\\2.0\\outputs\\best_model.pth", help="Path to model checkpoint")
-    parser.add_argument("--input", type=str, default="F:\\2.0\\pre_ct\\3__Se3__Shoulder 1.0 I40s 1__00010870.nii.gz", help="Input CT file or directory")
-    parser.add_argument("--output", type=str, default="F:\\2.0\\pre_ct_seg_pred", help="Output directory")
+    parser.add_argument("--checkpoint", type=str, default="F:\\2.0\\outputs_v2\\best_model.pth", help="Path to model checkpoint")
+    parser.add_argument("--input", type=str, default="F:\\2.0\\pre_ct\\1__Se202__1.0 x 0.8__04.18132.nii.gz", help="Input CT file or directory")
+    parser.add_argument("--output", type=str, default="F:\\2.0\\pre_ct_seg_pred_v2", help="Output directory")
     parser.add_argument("--sliding_window", action="store_true", default=True, help="Use sliding window inference")
     args = parser.parse_args()
 
@@ -208,14 +209,56 @@ def main():
     for ct_path in ct_files:
         print(f"Processing: {ct_path}")
 
-        # Load CT scan
-        ct_nifti = nib.load(ct_path)
+        # Extract ID from filename to find corresponding label
+        ct_filename = Path(ct_path).stem
+        try:
+            ct_id = int(ct_filename.split('__')[0])
+            label_path = LABEL_DIR / f"{ct_id}_seg.nii.gz"
+        except (ValueError, IndexError):
+            label_path = None
 
-        # Preprocess (same as training) - returns processed data, original shape, original affine, and orientation transforms
+        # Preprocess label first to get center for CT cropping
+        label_data_for_ct_crop = None
+        if label_path and label_path.exists():
+            label_nifti = nib.load(str(label_path))
+            label_ras = nib.as_closest_canonical(label_nifti)
+            label_data_ras = np.asarray(label_ras.get_fdata(), dtype=np.float32)
+            label_spacing = label_ras.header.get_zooms()
+
+            # Resample label to target spacing
+            label_data_ras = resample_to_spacing(label_data_ras, label_spacing, TARGET_SPACING)
+
+            # Find label center
+            label_slices = []
+            for d_idx in range(label_data_ras.shape[0]):
+                if label_data_ras[d_idx, :, :].max() > 0:
+                    label_slices.append(d_idx)
+            if label_slices:
+                label_center_d = (min(label_slices) + max(label_slices)) // 2
+            else:
+                label_center_d = label_data_ras.shape[0] // 2
+
+            # Crop label to TARGET_D_SIZE
+            target_d = TARGET_D_SIZE
+            current_d = label_data_ras.shape[0]
+            if current_d >= target_d:
+                start = max(0, label_center_d - target_d // 2)
+                if start + target_d > current_d:
+                    start = current_d - target_d
+                label_data_ras = label_data_ras[start:start + target_d]
+            else:
+                pad_before = (target_d - current_d) // 2
+                pad_after = target_d - current_d - pad_before
+                label_data_ras = np.pad(label_data_ras, [(pad_before, pad_after), (0, 0), (0, 0)], mode='constant', constant_values=0)
+
+            label_data_for_ct_crop = label_data_ras
+
+        # Load and preprocess CT
+        ct_nifti = nib.load(ct_path)
         ct_data, original_shape, original_affine, original_ornt, ras_ornt = preprocess_ct(ct_nifti)
         print(f"  Original shape: {original_shape}, Preprocessed shape: {ct_data.shape}")
 
-        # Predict
+        # Predict (returns argmaxed mask for multi-class)
         if args.sliding_window:
             print(f"  Using sliding window inference with patch size {PATCH_SIZE}")
             pred_mask = predict_ct_sliding_window(model, ct_data, device, PATCH_SIZE, overlap=0.5)
@@ -224,6 +267,38 @@ def main():
             pred_mask = predict_ct_full_volume(model, ct_data, device)
 
         print(f"  Predicted shape (preprocessed space): {pred_mask.shape}")
+
+        # Compute metrics if ground truth label exists
+        if label_path and label_path.exists() and label_data_for_ct_crop is not None:
+            # Use preprocessed label (same shape as CT after preprocessing)
+            label_binary = (label_data_for_ct_crop > 0).astype(np.float32)
+
+            # Clip to same size if needed
+            if label_binary.shape != pred_mask.shape:
+                min_d = min(label_binary.shape[0], pred_mask.shape[0])
+                min_h = min(label_binary.shape[1], pred_mask.shape[1])
+                min_w = min(label_binary.shape[2], pred_mask.shape[2])
+                label_binary = label_binary[:min_d, :min_h, :min_w]
+                pred_mask_crop = pred_mask[:min_d, :min_h, :min_w]
+            else:
+                pred_mask_crop = pred_mask
+
+            # Convert to tensors for metrics
+            # pred for metrics: (1, C, D, H, W), target: (1, D, H, W)
+            pred_tensor = torch.from_numpy(pred_mask_crop[np.newaxis]).unsqueeze(0).long()
+            label_tensor = torch.from_numpy(label_binary).unsqueeze(0).long()
+
+            # Compute metrics
+            dice_result = multi_class_dice_score(pred_tensor.float(), label_tensor, OUT_CHANNELS)
+            iou_result = multi_class_iou_score(pred_tensor.float(), label_tensor, OUT_CHANNELS)
+            mpa_result = mean_pixel_accuracy(pred_tensor.float(), label_tensor, OUT_CHANNELS)
+            surface_metrics = multi_class_surface_metrics(pred_tensor.float(), label_tensor, OUT_CHANNELS, voxel_spacing=TARGET_SPACING, threshold=1.0)
+
+            print(f"  Metrics:")
+            print(f"    Dice: {dice_result['mean']:.4f} (class0: {dice_result.get(0, 0):.4f}, class1: {dice_result.get(1, 0):.4f}, class2: {dice_result.get(2, 0):.4f})")
+            print(f"    IoU: {iou_result['mean']:.4f}")
+            print(f"    MPA: {mpa_result['mean']:.4f}")
+            print(f"    HD95: {surface_metrics['hd95_mean']:.4f}, ASD: {surface_metrics['asd_mean']:.4f}, Surface Dice: {surface_metrics['surface_dice_mean']:.4f}")
 
         # Resample prediction back to original input dimensions
         pred_mask_original = resample_to_shape(pred_mask, original_shape)

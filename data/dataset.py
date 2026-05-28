@@ -264,10 +264,10 @@ class CTSegmentationDataset(Dataset):
         # Extract random patch (ensures consistent size for batching)
         ct_data, label_data = self._extract_random_patch(ct_data, label_data)
 
-        # Convert to tensor (C, D, H, W)
+        # Convert to tensor (C, D, H, W) for CT, (D, H, W) for label
         ct_tensor = torch.from_numpy(ct_data).unsqueeze(0).float()
-        # Label as long tensor for CrossEntropyLoss (multi-class)
-        label_tensor = torch.from_numpy(label_data).unsqueeze(0).long()
+        # Label as long tensor for CrossEntropyLoss (multi-class, no channel dim)
+        label_tensor = torch.from_numpy(label_data).long()
 
         return ct_tensor, label_tensor
 

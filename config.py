@@ -7,14 +7,14 @@ from pathlib import Path
 # Paths
 DATA_DIR = Path(__file__).parent.parent / "pre_ct"
 LABEL_DIR = Path(__file__).parent.parent / "pre_ct_seg"
-OUTPUT_DIR = Path(__file__).parent.parent / "outputs"
+OUTPUT_DIR = Path(__file__).parent.parent / "outputs_v2"
 
 # Training IDs (already annotated: 77-117)
 TRAIN_IDS = list(range(1, 118))  # 77 to 117 inclusive
 
 # Model
 IN_CHANNELS = 1          # CT is single channel (grayscale)
-OUT_CHANNELS = 2        # Multi-class segmentation (scapula + femur)
+OUT_CHANNELS = 3        # Multi-class segmentation (background + scapula + femur)
 FEATURE_DEPTHS = [32, 64, 128, 256]  # Encoder depths
 USE_ATTENTION = True    # Use attention gates
 USE_RESIDUAL = True     # Use residual connections

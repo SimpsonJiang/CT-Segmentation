@@ -67,6 +67,68 @@ def f1_score(pred, target, smooth=1e-6):
     return f1
 
 
+def pixel_accuracy(pred, target):
+    """Calculate pixel accuracy (binary case).
+
+    Args:
+        pred: (N,) tensor of predictions (0 or 1)
+        target: (N,) tensor of ground truth (0 or 1)
+
+    Returns:
+        Accuracy (0 to 1)
+    """
+    pred = pred.view(-1)
+    target = target.view(-1)
+
+    correct = (pred == target).sum().item()
+    total = pred.numel()
+
+    return correct / total
+
+
+def mean_pixel_accuracy(pred, target, num_classes, smooth=1e-6):
+    """
+    Calculate mean pixel accuracy for multi-class segmentation.
+
+    MPA = (1/C) * Σ(c) (TP_c / (TP_c + FP_c + TN_c + FN_c))
+
+    Args:
+        pred: (B, C, D, H, W) tensor of logits
+        target: (B, D, H, W) tensor of class indices
+        num_classes: number of classes
+        smooth: smoothing factor (for numerical stability)
+
+    Returns:
+        Dictionary with per-class accuracy and mean accuracy
+    """
+    # Get predictions as class indices
+    pred_indices = torch.argmax(pred, dim=1)  # (B, D, H, W)
+
+    acc_per_class = {}
+    for c in range(num_classes):
+        pred_c = (pred_indices == c)
+        target_c = (target == c)
+
+        # True positives: pred_c=True and target_c=True
+        tp = (pred_c & target_c).sum().item()
+        # False positives: pred_c=True and target_c=False
+        fp = (pred_c & ~target_c).sum().item()
+        # True negatives: pred_c=False and target_c=False
+        tn = (~pred_c & ~target_c).sum().item()
+        # False negatives: pred_c=False and target_c=True
+        fn = (~pred_c & target_c).sum().item()
+
+        # Pixel accuracy for class c
+        total = tp + fp + tn + fn
+        if total > 0:
+            acc_per_class[c] = (tp + tn) / total
+        else:
+            acc_per_class[c] = 0.0
+
+    acc_per_class['mean'] = sum(acc_per_class.values()) / len(acc_per_class)
+    return acc_per_class
+
+
 def multi_class_dice_score(pred, target, num_classes, smooth=1e-6):
     """
     Calculate Dice score for each class in multi-class segmentation.
