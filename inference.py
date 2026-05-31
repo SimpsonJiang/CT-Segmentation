@@ -153,7 +153,7 @@ def predict_ct_sliding_window(model, ct_data, device, patch_size=PATCH_SIZE, ove
     # Get final class prediction via argmax
     pred_mask = np.argmax(output, axis=0).astype(np.uint8)
 
-    return pred_mask
+    return pred_mask, output
 
 
 def predict_ct_full_volume(model, ct_data, device):
@@ -168,7 +168,7 @@ def predict_ct_full_volume(model, ct_data, device):
 
     # Get final class prediction via argmax
     pred_mask = np.argmax(pred_prob, axis=0).astype(np.uint8)
-    return pred_mask
+    return pred_mask, pred_prob
 
 
 def resample_to_shape(data, target_shape):
@@ -178,11 +178,69 @@ def resample_to_shape(data, target_shape):
     return resampled
 
 
+def remove_small_islands(mask, min_size=100):
+    """Remove small isolated islands of each class using connected components"""
+    cleaned = mask.copy()
+    for class_id in np.unique(mask):
+        if class_id == 0:
+            continue  # Skip background
+        class_mask = (mask == class_id)
+        labeled, num_features = ndimage.label(class_mask)
+        for i in range(1, num_features + 1):
+            component_size = (labeled == i).sum()
+            if component_size < min_size:
+                cleaned[labeled == i] = 0  # Set to background
+    return cleaned
+
+
+def enforce_class_exclusivity(mask, prob_output, min_confidence=0.3):
+    """
+    Clean up predictions where one class is embedded within another.
+    If label A is surrounded entirely by label B, and the probability of B is high,
+    change label A to B.
+    """
+    cleaned = mask.copy()
+    num_classes = OUT_CHANNELS
+
+    # For each class, check if it's surrounded by another class
+    for target_class in range(1, num_classes):
+        class_mask = (cleaned == target_class)
+        if not class_mask.any():
+            continue
+
+        # Find connected components of this class
+        labeled, num_features = ndimage.label(class_mask)
+
+        for i in range(1, num_features + 1):
+            component = (labeled == i)
+            # Check if this component is surrounded by exactly one other class
+            # Get neighbors (6-connectivity)
+            footprint = np.array([[[0,0,0],[0,1,0],[0,0,0]],
+                                  [[0,1,0],[1,1,1],[0,1,0]],
+                                  [[0,0,0],[0,1,0],[0,0,0]]])
+            boundary_mask = ndimage.binary_dilation(component, structure=footprint) & ~component
+
+            # Find what classes are at the boundary
+            boundary_classes = cleaned[boundary_mask]
+            unique_boundary = np.unique(boundary_classes)
+
+            # If surrounded by only one class (and that class is not background or itself)
+            if len(unique_boundary) == 1 and unique_boundary[0] != 0 and unique_boundary[0] != target_class:
+                surrounding_class = unique_boundary[0]
+                # Check if the probability for surrounding class is high enough at these voxels
+                component_coords = np.where(component)
+                prob_at_component = prob_output[surrounding_class][component_coords[0], component_coords[1], component_coords[2]]
+                if prob_at_component.mean() > min_confidence:
+                    cleaned[component] = surrounding_class
+
+    return cleaned
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run inference on CT scans")
-    parser.add_argument("--checkpoint", type=str, default="F:\\2.0\\outputs_v2\\best_model.pth", help="Path to model checkpoint")
-    parser.add_argument("--input", type=str, default="F:\\2.0\\pre_ct\\1__Se202__1.0 x 0.8__04.18132.nii.gz", help="Input CT file or directory")
-    parser.add_argument("--output", type=str, default="F:\\2.0\\pre_ct_seg_pred_v2", help="Output directory")
+    parser.add_argument("--checkpoint", type=str, default="F:\\2.0\\outputs_v3.2\\best_model.pth", help="Path to model checkpoint")
+    parser.add_argument("--input", type=str, default="F:\\2.0\\pre_ct\\117__Se301__0.625mm__43808702.nii.gz", help="Input CT file or directory")
+    parser.add_argument("--output", type=str, default="F:\\2.0\\pre_ct_seg_pred_v3.2", help="Output directory")
     parser.add_argument("--sliding_window", action="store_true", default=True, help="Use sliding window inference")
     args = parser.parse_args()
 
@@ -213,7 +271,13 @@ def main():
         ct_filename = Path(ct_path).stem
         try:
             ct_id = int(ct_filename.split('__')[0])
-            label_path = LABEL_DIR / f"{ct_id}_seg.nii.gz"
+            # Search in both original and new label directories
+            label_path = None
+            for label_dir in [LABEL_DIR_ORIG, LABEL_DIR_NEW]:
+                candidate = label_dir / f"{ct_id}_seg.nii.gz"
+                if candidate.exists():
+                    label_path = candidate
+                    break
         except (ValueError, IndexError):
             label_path = None
 
@@ -261,10 +325,19 @@ def main():
         # Predict (returns argmaxed mask for multi-class)
         if args.sliding_window:
             print(f"  Using sliding window inference with patch size {PATCH_SIZE}")
-            pred_mask = predict_ct_sliding_window(model, ct_data, device, PATCH_SIZE, overlap=0.5)
+            pred_mask, pred_prob = predict_ct_sliding_window(model, ct_data, device, PATCH_SIZE, overlap=0.5)
         else:
             print(f"  Using full volume inference")
-            pred_mask = predict_ct_full_volume(model, ct_data, device)
+            pred_mask, pred_prob = predict_ct_full_volume(model, ct_data, device)
+
+        print(f"  Predicted shape (preprocessed space): {pred_mask.shape}")
+
+        # Post-processing: remove small isolated islands
+        pred_mask = remove_small_islands(pred_mask, min_size=500)
+        print(f"  After removing small islands: {(pred_mask > 0).sum()} voxels")
+
+        # Post-processing: enforce class exclusivity (fix boundary confusion)
+        pred_mask = enforce_class_exclusivity(pred_mask, pred_prob, min_confidence=0.5)
 
         print(f"  Predicted shape (preprocessed space): {pred_mask.shape}")
 

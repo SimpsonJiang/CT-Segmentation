@@ -125,7 +125,9 @@ def mean_pixel_accuracy(pred, target, num_classes, smooth=1e-6):
         else:
             acc_per_class[c] = 0.0
 
-    acc_per_class['mean'] = sum(acc_per_class.values()) / len(acc_per_class)
+    # Mean over foreground classes only (excluding background class 0)
+    fg_classes = [c for c in acc_per_class.keys() if c != 'mean']
+    acc_per_class['mean'] = sum(acc_per_class[c] for c in fg_classes) / len(fg_classes)
     return acc_per_class
 
 
@@ -154,7 +156,9 @@ def multi_class_dice_score(pred, target, num_classes, smooth=1e-6):
         dice = (2.0 * intersection + smooth) / (pred_c.sum() + target_c.sum() + smooth)
         dice_per_class[c] = dice.item()
 
-    dice_per_class['mean'] = sum(dice_per_class.values()) / len(dice_per_class)
+    # Mean over foreground classes only (excluding background class 0)
+    fg_classes = [c for c in dice_per_class.keys() if c != 'mean']
+    dice_per_class['mean'] = sum(dice_per_class[c] for c in fg_classes) / len(fg_classes)
     return dice_per_class
 
 
@@ -174,7 +178,9 @@ def multi_class_iou_score(pred, target, num_classes, smooth=1e-6):
         iou = (intersection + smooth) / (union + smooth)
         iou_per_class[c] = iou.item()
 
-    iou_per_class['mean'] = sum(iou_per_class.values()) / len(iou_per_class)
+    # Mean over foreground classes only (excluding background class 0)
+    fg_classes = [c for c in iou_per_class.keys() if c != 'mean']
+    iou_per_class['mean'] = sum(iou_per_class[c] for c in fg_classes) / len(fg_classes)
     return iou_per_class
 
 
@@ -342,7 +348,9 @@ def surface_dice(pred, label, threshold=1.0, voxel_spacing=None):
     pred_within = np.sum(dist_pred_to_label <= threshold)
     label_within = np.sum(dist_label_to_pred <= threshold)
 
-    surface_dice = (2.0 * (pred_within + label_within)) / (len(pred_surface) + len(label_surface))
+    # Corrected Surface Dice formula: mean of bidirectional overlap within threshold
+    # Value range: [0, 1]
+    surface_dice = (pred_within + label_within) / (len(pred_surface) + len(label_surface))
 
     return surface_dice
 

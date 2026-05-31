@@ -29,11 +29,16 @@ class DiceLoss(nn.Module):
 
 
 class MultiClassDiceLoss(nn.Module):
-    """Dice loss for multi-class segmentation"""
+    """Dice loss for multi-class segmentation with class weights"""
 
-    def __init__(self, smooth=1e-6):
+    def __init__(self, smooth=1e-6, class_weights=None):
+        """
+        class_weights: list of weights for each class, e.g. [1.0, 1.5, 1.0]
+                       gives more weight to class 1 (Femur)
+        """
         super().__init__()
         self.smooth = smooth
+        self.class_weights = class_weights if class_weights else [1.0] * 3
 
     def forward(self, pred, target):
         """
@@ -44,10 +49,12 @@ class MultiClassDiceLoss(nn.Module):
         pred = F.softmax(pred, dim=1)  # (B, C, D, H, W)
 
         num_classes = pred.shape[1]
-        total_dice = 0.0
+        total_weight = 0.0
+        weighted_dice = 0.0
 
-        # Compute Dice for each class (including background as class 0)
+        # Compute weighted Dice for each class (including background as class 0)
         for c in range(num_classes):
+            weight = self.class_weights[c] if c < len(self.class_weights) else 1.0
             pred_c = pred[:, c].contiguous().view(-1)
             target_c = (target == c).float().contiguous().view(-1)
 
@@ -55,9 +62,10 @@ class MultiClassDiceLoss(nn.Module):
             dice = (2.0 * intersection + self.smooth) / (
                 pred_c.sum() + target_c.sum() + self.smooth
             )
-            total_dice += dice
+            weighted_dice += weight * dice
+            total_weight += weight
 
-        return 1 - (total_dice / num_classes)
+        return 1 - (weighted_dice / total_weight)
 
 
 class BoundaryLoss(nn.Module):
@@ -148,12 +156,27 @@ class MultiClassDiceCELoss(nn.Module):
 class MultiClassDiceCEBoundaryLoss(nn.Module):
     """Combined Multi-class Dice, CrossEntropy and Boundary loss"""
 
-    def __init__(self, dice_weight=0.4, ce_weight=0.4, boundary_weight=0.2):
+    def __init__(self, dice_weight=0.4, ce_weight=0.4, boundary_weight=0.2, femur_weight=1.5, scapula_weight=1.0):
+        """
+        femur_weight: relative weight for Femur (label=1), e.g. 1.5 means Femur has 1.5x weight
+        scapula_weight: relative weight for Scapula (label=2), e.g. 1.0 means Scapula has 1.0x weight
+        Background (label=0) weight is 1.0
+        Final weights are normalized so that all class weights sum to 3.0
+        """
         super().__init__()
         self.dice_weight = dice_weight
         self.ce_weight = ce_weight
         self.boundary_weight = boundary_weight
-        self.dice_loss = MultiClassDiceLoss()
+
+        # Normalize class weights so total = 3.0 (for 3 classes)
+        total = 1.0 + femur_weight + scapula_weight  # background + femur + scapula
+        class_weights = [
+            1.0 / total * 3.0,  # background
+            femur_weight / total * 3.0,  # femur
+            scapula_weight / total * 3.0   # scapula
+        ]
+
+        self.dice_loss = MultiClassDiceLoss(class_weights=class_weights)
         self.ce_loss = nn.CrossEntropyLoss()
         self.boundary_loss = BoundaryLoss()
 
@@ -190,7 +213,8 @@ def get_loss_fn(loss_type="dice_ce"):
     elif loss_type == "multi_dice_ce":
         return MultiClassDiceCELoss(dice_weight=0.5, ce_weight=0.5)
     elif loss_type == "multi_dice_ce_boundary":
-        return MultiClassDiceCEBoundaryLoss(dice_weight=0.4, ce_weight=0.4, boundary_weight=0.2)
+        # femur_weight=1.5 means Femur gets 1.5x weight, Scapula gets 1.0x weight
+        return MultiClassDiceCEBoundaryLoss(dice_weight=0.35, ce_weight=0.35, boundary_weight=0.30, femur_weight=1.5, scapula_weight=1.0)
     elif loss_type == "focal":
         return FocalLoss()
     else:

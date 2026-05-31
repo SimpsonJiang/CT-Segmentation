@@ -18,20 +18,26 @@ class CTSegmentationDataset(Dataset):
 
     def __init__(self, data_dir, label_dir, ids, target_spacing=(1.0, 1.0, 1.0),
                  target_d_size=392, hu_window=(-300, 1200), patch_size=(128, 128, 128),
-                 augment=False):
+                 augment=False, extra_data_dirs=None, extra_label_dirs=None):
         """
         Args:
-            data_dir: Path to CT scans (pre_ct)
-            label_dir: Path to segmentation labels (pre_ct_seg)
+            data_dir: Primary path to CT scans
+            label_dir: Primary path to segmentation labels
             ids: List of IDs to use for training
             target_spacing: Target spacing (D, H, W) in mm
             target_d_size: Target D dimension size
             hu_window: HU window range (min, max)
             patch_size: Size of random patches to extract (D, H, W)
             augment: Whether to apply data augmentation
+            extra_data_dirs: Additional CT data directories to search
+            extra_label_dirs: Additional label directories to search
         """
-        self.data_dir = Path(data_dir)
-        self.label_dir = Path(label_dir)
+        self.data_dirs = [Path(data_dir)]
+        self.label_dirs = [Path(label_dir)]
+        if extra_data_dirs:
+            self.data_dirs.extend([Path(d) for d in extra_data_dirs])
+        if extra_label_dirs:
+            self.label_dirs.extend([Path(d) for d in extra_label_dirs])
         self.ids = ids
         self.target_spacing = target_spacing
         self.target_d_size = target_d_size
@@ -40,35 +46,72 @@ class CTSegmentationDataset(Dataset):
         self.augment = augment
 
         self.file_pairs = []
+        skipped = 0
         for id_ in ids:
             ct_file = self._find_ct_file(id_)
             label_file = self._find_label_file(id_)
 
             if ct_file and label_file:
-                self.file_pairs.append((ct_file, label_file))
+                # Check if H and W are both 128 after preprocessing
+                if self._check_hw_size(ct_file, label_file):
+                    self.file_pairs.append((ct_file, label_file))
+                else:
+                    skipped += 1
 
-        print(f"Found {len(self.file_pairs)} file pairs for training")
+        print(f"Found {len(self.file_pairs)} file pairs for training (skipped {skipped} files with H or W != 128)")
 
     def _find_ct_file(self, id_):
-        """Find CT file by ID"""
-        pattern = str(self.data_dir / f"{id_}__*.nii.gz")
-        files = glob.glob(pattern)
-        return files[0] if files else None
+        """Find CT file by ID in multiple directories"""
+        # Search in data_dirs list
+        for data_dir in self.data_dirs:
+            pattern = str(data_dir / f"{id_}__*.nii.gz")
+            files = glob.glob(pattern)
+            if files:
+                return files[0]
+        return None
 
     def _find_label_file(self, id_):
-        """Find label file by ID"""
-        # Try exact match first
-        label_file = self.label_dir / f"{id_}_seg.nii.gz"
-        if label_file.exists():
-            return str(label_file)
-
-        # Try versioned files
-        for version in ["", "v2", "v3"]:
-            label_file = self.label_dir / f"{id_}_seg{version}.nii.gz"
+        """Find label file by ID in multiple directories"""
+        # Search in label_dirs list
+        for label_dir in self.label_dirs:
+            # Try exact match first
+            label_file = label_dir / f"{id_}_seg.nii.gz"
             if label_file.exists():
                 return str(label_file)
 
+            # Try versioned files
+            for version in ["", "v2", "v3"]:
+                label_file = label_dir / f"{id_}_seg{version}.nii.gz"
+                if label_file.exists():
+                    return str(label_file)
         return None
+
+    def _check_hw_size(self, ct_file, label_file):
+        """Check if W is at least 128 after preprocessing (H is always >= 128 based on data analysis)"""
+        try:
+            ct_nifti = nib.load(ct_file)
+            label_nifti = nib.load(label_file)
+
+            # Preprocess CT
+            ct_ras = nib.as_closest_canonical(ct_nifti)
+            ct_data = np.asarray(ct_ras.get_fdata(), dtype=np.float32)
+            ct_data = self._resample_to_spacing(ct_data, ct_ras.header.get_zooms(), self.target_spacing)
+
+            # Preprocess label
+            label_ras = nib.as_closest_canonical(label_nifti)
+            label_data = np.asarray(label_ras.get_fdata(), dtype=np.float32)
+            label_data = self._resample_to_spacing(label_data, label_ras.header.get_zooms(), self.target_spacing)
+
+            # Crop D
+            label_center_d = self._find_label_center_d(label_data)
+            ct_data = self._crop_d_centered(ct_data, label_center_d, self.target_d_size)
+            label_data = self._crop_d_centered(label_data, label_center_d, self.target_d_size)
+
+            _, h, w = ct_data.shape
+            # Only need to check W >= 128, H is always >= 128 based on data analysis
+            return w >= 128
+        except Exception:
+            return False
 
     def _resample_to_spacing(self, data, original_spacing, target_spacing):
         """Resample 3D volume to target spacing"""
@@ -130,24 +173,10 @@ class CTSegmentationDataset(Dataset):
     def _extract_random_patch(self, ct_data, label_data):
         """Extract patch of fixed size from CT and label.
         50% chance to sample centered on label region, 50% random.
+        All files have H >= 128 and W >= 128 after filtering at load time.
         """
         d, h, w = ct_data.shape
         patch_d, patch_h, patch_w = self.patch_size
-
-        # If data is smaller than patch in any dimension, pad it
-        if d < patch_d or h < patch_h or w < patch_w:
-            pad_d = max(0, patch_d - d)
-            pad_h = max(0, patch_h - h)
-            pad_w = max(0, patch_w - w)
-
-            ct_data = np.pad(ct_data, [(pad_d//2, pad_d - pad_d//2),
-                                        (pad_h//2, pad_h - pad_h//2),
-                                        (pad_w//2, pad_w - pad_w//2)], mode='constant', constant_values=0)
-            label_data = np.pad(label_data, [(pad_d//2, pad_d - pad_d//2),
-                                             (pad_h//2, pad_h - pad_h//2),
-                                             (pad_w//2, pad_w - pad_w//2)], mode='constant', constant_values=0)
-
-            d, h, w = ct_data.shape
 
         # Find label center for "centered" sampling
         label_slices = []
@@ -158,29 +187,13 @@ class CTSegmentationDataset(Dataset):
         # 50% chance: sample centered on label region
         if label_slices and np.random.rand() < 0.5:
             label_center_d = (min(label_slices) + max(label_slices)) // 2
-
-            # Find a random H, W position within label region for this slice
-            label_slice_2d = label_data[label_center_d, :, :]
-            label_h_indices, label_w_indices = np.where(label_slice_2d > 0.5)
-
-            if len(label_h_indices) > 0 and len(label_w_indices) > 0:
-                # Random center within label region
-                center_h = np.random.choice(label_h_indices)
-                center_w = np.random.choice(label_w_indices)
-            else:
-                # No label in this slice, use random
-                center_h = np.random.randint(patch_h // 2, h - patch_h // 2)
-                center_w = np.random.randint(patch_w // 2, w - patch_w // 2)
-
-            # Calculate start positions (patch centered on label region with some randomness)
             start_d = max(0, min(label_center_d - patch_d // 2 + np.random.randint(-10, 10), d - patch_d))
-            start_h = max(0, min(center_h - patch_h // 2, h - patch_h))
-            start_w = max(0, min(center_w - patch_w // 2, w - patch_w))
         else:
-            # 50% chance: pure random crop
-            start_d = np.random.randint(0, max(1, d - patch_d)) if d > patch_d else 0
-            start_h = np.random.randint(0, max(1, h - patch_h)) if h > patch_h else 0
-            start_w = np.random.randint(0, max(1, w - patch_w)) if w > patch_w else 0
+            start_d = np.random.randint(0, max(1, d - patch_d + 1)) if d > patch_d else 0
+
+        # H and W are always >= 128, so we center the crop at the middle
+        start_h = (h - patch_h) // 2
+        start_w = (w - patch_w) // 2
 
         # Extract patch
         ct_patch = ct_data[start_d:start_d + patch_d,
@@ -251,6 +264,7 @@ class CTSegmentationDataset(Dataset):
         return len(self.file_pairs)
 
     def __getitem__(self, idx):
+        """Get item from dataset"""
         ct_path, label_path = self.file_pairs[idx]
 
         # Load CT scan and label
@@ -261,12 +275,11 @@ class CTSegmentationDataset(Dataset):
         ct_data = self._preprocess_ct(ct_nifti, label_nifti)
         label_data = self._preprocess_label(label_nifti)
 
-        # Extract random patch (ensures consistent size for batching)
+        # Extract random patch
         ct_data, label_data = self._extract_random_patch(ct_data, label_data)
 
         # Convert to tensor (C, D, H, W) for CT, (D, H, W) for label
         ct_tensor = torch.from_numpy(ct_data).unsqueeze(0).float()
-        # Label as long tensor for CrossEntropyLoss (multi-class, no channel dim)
         label_tensor = torch.from_numpy(label_data).long()
 
         return ct_tensor, label_tensor

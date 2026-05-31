@@ -4,13 +4,19 @@ Configuration for 3D UNet training on CT segmentation
 import os
 from pathlib import Path
 
-# Paths
-DATA_DIR = Path(__file__).parent.parent / "pre_ct"
-LABEL_DIR = Path(__file__).parent.parent / "pre_ct_seg"
-OUTPUT_DIR = Path(__file__).parent.parent / "outputs_v2"
+# Paths - supporting both original and new data
+DATA_DIR_ORIG = Path(__file__).parent.parent / "pre_ct"
+LABEL_DIR_ORIG = Path(__file__).parent.parent / "pre_ct_seg"
+DATA_DIR_NEW = Path(__file__).parent.parent / "pre_ct_1"
+LABEL_DIR_NEW = Path(__file__).parent.parent / "pre_ct_seg_1"
+OUTPUT_DIR = Path(__file__).parent.parent / "outputs_v3.2"  # New output directory for v3 training
 
-# Training IDs (already annotated: 77-117)
-TRAIN_IDS = list(range(1, 118))  # 77 to 117 inclusive
+# Training IDs - use all available labeled data
+# Original: 1-60, 77-117 (97 IDs with labels)
+# New: 118-172 (53 IDs with labels, missing 134, 159, 167)
+TRAIN_IDS_ORIG = list(range(1, 118))
+TRAIN_IDS_NEW = list(range(118, 174))  # 118-173
+TRAIN_IDS = TRAIN_IDS_ORIG + TRAIN_IDS_NEW
 
 # Model
 IN_CHANNELS = 1          # CT is single channel (grayscale)
@@ -28,6 +34,7 @@ NUM_WORKERS = 0  # Set to 0 on Windows to avoid multiprocessing issues
 
 # Loss
 LOSS_TYPE = "multi_dice_ce_boundary"    # multi_dice_ce_boundary, multi_dice_ce, dice_ce, dice, ce
+BOUNDARY_LOSS_WEIGHT = 0.35  # Increased from 0.2 to better handle boundary confusion
 
 # Preprocessing
 TARGET_SPACING = [1.0, 1.0, 1.0]  # mm (D, H, W)

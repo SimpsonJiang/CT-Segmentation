@@ -79,6 +79,14 @@ def validate_epoch(model, dataloader, criterion, device, epoch):
     running_asd = 0.0
     running_surface_dice = 0.0
 
+    # Per-class accumulation
+    dice_per_class_sum = {1: 0.0, 2: 0.0}  # femur=1, scapula=2
+    iou_per_class_sum = {1: 0.0, 2: 0.0}
+    hd95_per_class_sum = {1: 0.0, 2: 0.0}
+    asd_per_class_sum = {1: 0.0, 2: 0.0}
+    surface_dice_per_class_sum = {1: 0.0, 2: 0.0}
+    num_batches = 0
+
     with torch.no_grad():
         pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Val]")
         for ct, label in pbar:
@@ -98,11 +106,28 @@ def validate_epoch(model, dataloader, criterion, device, epoch):
             running_iou += iou_result['mean']
             running_mpa += mpa_result['mean']
 
+            # Per-class metrics (label 1=femur, label 2=scapula)
+            for c in [1, 2]:
+                if c in dice_result:
+                    dice_per_class_sum[c] += dice_result[c]
+                if c in iou_result:
+                    iou_per_class_sum[c] += iou_result[c]
+
             # Surface metrics (for each foreground class)
             surface_metrics = multi_class_surface_metrics(pred, label, OUT_CHANNELS, voxel_spacing=TARGET_SPACING, threshold=1.0)
             running_hd95 += surface_metrics['hd95_mean']
             running_asd += surface_metrics['asd_mean']
             running_surface_dice += surface_metrics['surface_dice_mean']
+
+            for c in [1, 2]:
+                if c in surface_metrics.get('hd95', {}):
+                    hd95_per_class_sum[c] += surface_metrics['hd95'][c]
+                if c in surface_metrics.get('asd', {}):
+                    asd_per_class_sum[c] += surface_metrics['asd'][c]
+                if c in surface_metrics.get('surface_dice', {}):
+                    surface_dice_per_class_sum[c] += surface_metrics['surface_dice'][c]
+
+            num_batches += 1
 
     epoch_loss = running_loss / len(dataloader)
     epoch_dice = running_dice / len(dataloader)
@@ -112,7 +137,15 @@ def validate_epoch(model, dataloader, criterion, device, epoch):
     epoch_asd = running_asd / len(dataloader)
     epoch_surface_dice = running_surface_dice / len(dataloader)
 
-    return epoch_loss, epoch_dice, epoch_iou, epoch_mpa, epoch_hd95, epoch_asd, epoch_surface_dice
+    # Per-class epoch averages
+    dice_per_class = {c: v / num_batches for c, v in dice_per_class_sum.items()}
+    iou_per_class = {c: v / num_batches for c, v in iou_per_class_sum.items()}
+    hd95_per_class = {c: v / num_batches for c, v in hd95_per_class_sum.items()}
+    asd_per_class = {c: v / num_batches for c, v in asd_per_class_sum.items()}
+    surface_dice_per_class = {c: v / num_batches for c, v in surface_dice_per_class_sum.items()}
+
+    return (epoch_loss, epoch_dice, epoch_iou, epoch_mpa, epoch_hd95, epoch_asd, epoch_surface_dice,
+            dice_per_class, iou_per_class, hd95_per_class, asd_per_class, surface_dice_per_class)
 
 
 def main():
@@ -138,14 +171,16 @@ def main():
     # Dataset
     print(f"Loading dataset with IDs: {TRAIN_IDS}")
     full_dataset = CTSegmentationDataset(
-        data_dir=DATA_DIR,
-        label_dir=LABEL_DIR,
+        data_dir=DATA_DIR_ORIG,
+        label_dir=LABEL_DIR_ORIG,
         ids=TRAIN_IDS,
         target_spacing=TARGET_SPACING,
         target_d_size=TARGET_D_SIZE,
         hu_window=(HU_WINDOW_MIN, HU_WINDOW_MAX),
         patch_size=PATCH_SIZE,
         augment=True,
+        extra_data_dirs=[DATA_DIR_NEW],
+        extra_label_dirs=[LABEL_DIR_NEW],
     )
 
     # Split dataset
@@ -201,13 +236,18 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         train_loss, train_dice = train_epoch(model, train_loader, criterion, optimizer, scaler, device, epoch)
-        val_loss, val_dice, val_iou, val_mpa, val_hd95, val_asd, val_surface_dice = validate_epoch(model, val_loader, criterion, device, epoch)
+        val_results = validate_epoch(model, val_loader, criterion, device, epoch)
+        (val_loss, val_dice, val_iou, val_mpa, val_hd95, val_asd, val_surface_dice,
+         dice_per_class, iou_per_class, hd95_per_class, asd_per_class, surface_dice_per_class) = val_results
 
         scheduler.step(val_loss)
 
         print(f"\nEpoch {epoch}: Train Loss: {train_loss:.4f}, Train Dice: {train_dice:.4f}")
         print(f"           Val Loss: {val_loss:.4f}, Val Dice: {val_dice:.4f}, Val IoU: {val_iou:.4f}, Val MPA: {val_mpa:.4f}")
         print(f"           HD95: {val_hd95:.4f}, ASD: {val_asd:.4f}, Surface Dice: {val_surface_dice:.4f}")
+        print(f"  ---- Per-class metrics ----")
+        print(f"  Femur (label=1):   Dice={dice_per_class.get(1, 0):.4f}, IoU={iou_per_class.get(1, 0):.4f}, HD95={hd95_per_class.get(1, 0):.4f}, ASD={asd_per_class.get(1, 0):.4f}, SurfDice={surface_dice_per_class.get(1, 0):.4f}")
+        print(f"  Scapula (label=2):  Dice={dice_per_class.get(2, 0):.4f}, IoU={iou_per_class.get(2, 0):.4f}, HD95={hd95_per_class.get(2, 0):.4f}, ASD={asd_per_class.get(2, 0):.4f}, SurfDice={surface_dice_per_class.get(2, 0):.4f}")
 
         # Save best model
         if val_dice > best_dice:
